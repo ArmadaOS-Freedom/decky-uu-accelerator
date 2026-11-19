@@ -91,7 +91,7 @@ def detect_platform(root, home, which=None):
         engines = []
         recommended = None
 
-    legacy_install = any((root / unit).is_file() for unit in _LEGACY_UNITS)
+    legacy_install = _has_legacy_unit(root)
 
     return {
         "os_id": os_id,
@@ -105,17 +105,17 @@ def detect_platform(root, home, which=None):
     }
 
 
-def select_engine(platform, request="auto"):
+def select_engine(platform, request="auto", *, allow_legacy_takeover=False):
     """Resolve a requested engine to a concrete package choice.
 
     Only ``"auto"`` and ``"fex"`` are allowed; the plugin is FEX-only on an
     ARM64 host with a discovered FEX interpreter. An unavailable or unknown
     request always raises instead of silently switching to another engine. A
-    preexisting legacy installation is refused on *every* route: our plugin
-    never takes over or replaces a UU install it did not create, so an explicit
-    engine must not become a loophole around the guard.
+    preexisting legacy installation is refused by default; the install path
+    opts in with ``allow_legacy_takeover=True`` after validating that layout
+    through :class:`OfficialInstall`.
     """
-    if platform.get("legacy_install"):
+    if platform.get("legacy_install") and not allow_legacy_takeover:
         raise ValueError("检测到已存在的 uuplugin 安装，本插件不会接管或替换它")
 
     if request not in ("auto", "fex"):
@@ -170,6 +170,21 @@ def _arch_from_uname():
     if arch is None:
         raise ValueError("不支持的主机架构: {}".format(machine or "unknown"))
     return arch
+
+
+def _has_legacy_unit(root):
+    """Whether a legacy ``uuplugin.service`` file or symlink is present.
+
+    Only the legacy unit name is inspected; symlinks (including broken or
+    dangling ones) count as present so an unknown/relocated unit is never
+    silently accepted as absent.
+    """
+    root = Path(root)
+    for relative in _LEGACY_UNITS:
+        path = root / relative
+        if path.is_file() or path.is_symlink():
+            return True
+    return False
 
 
 def _read_os_id(root):

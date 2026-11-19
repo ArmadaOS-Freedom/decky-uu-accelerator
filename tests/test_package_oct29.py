@@ -112,7 +112,7 @@ class PackageOct29Test(unittest.TestCase):
         zip_path = self._single_zip(out_dir)
         with zipfile.ZipFile(zip_path) as archive:
             names = archive.namelist()
-        self.assertEqual(len(names), 30)
+        self.assertEqual(len(names), 31)
         for module in OCT29_MODULES + PORTABLE_MODULES + PORTABLE_ABI_FILES:
             self.assertIn(module, names)
         self.assertIn("uu-accelerator/kernel_abi.py", names)

@@ -267,13 +267,12 @@ function UuPanel() {
   const engines = status?.engines ?? [];
   const installed = !!status?.installed;
   const currentEngine = status?.engine ?? null;
-  const legacyInstall = !!status?.platform?.legacy_install;
   const busy = !!status?.busy;
   const disabled = !status || pending !== null || busy || updateBusy || !!pollError;
 
   const canUseFex = engines.includes("fex");
   const legacyCore = installed && currentEngine !== "fex";
-  const canInstall = !disabled && !legacyInstall && canUseFex;
+  const canInstall = !disabled && canUseFex;
 
   const primaryLabel = installed ? "安装 / 更新核心" : "安装核心";
 
@@ -417,11 +416,6 @@ function UuPanel() {
             <div style={errorStyle}>
               检测到旧版插件核心，已不再支持；安装 FEX 核心即可替换，绑定身份会保留。停止或卸载核心仍可使用。
             </div>
-          </PanelSectionRow>
-        )}
-        {legacyInstall && (
-          <PanelSectionRow>
-            <div style={errorStyle}>检测到旧的官方安装方式，为避免冲突已禁用安装，请先手动清理旧安装。</div>
           </PanelSectionRow>
         )}
         <PanelSectionRow>

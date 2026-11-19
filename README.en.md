@@ -53,7 +53,7 @@ The **Source code** archives on the release page are not installable plugin pack
 
 ### 2. Install the core and pair your phone
 
-1. Select **安装核心** (Install core) and wait for download, verification, and installation to finish. The first installation starts the service automatically.
+1. Select **安装核心** (Install core) and wait for download, verification, and installation to finish. The first installation starts the service and automatically replaces recognized official Steam Deck installations. Follow the steps below to pair your phone after switching from an official installation.
 2. Wait for a QR code under **手机绑定** (Phone pairing). If the service is stopped, select **启动服务** (Start service) first.
 3. Open **UU主机加速器** on your phone, scan the code using its pairing option, and follow the app's instructions.
 4. Choose a game or the **Steam Store**, select a node, and start acceleration on your phone. The plugin updates to **加速中** (Accelerating) when it detects the acceleration channel.

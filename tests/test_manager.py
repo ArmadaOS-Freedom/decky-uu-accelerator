@@ -698,16 +698,276 @@ class ManagerTestCase(unittest.TestCase):
             fresh.uninstall()
         self.assertEqual(self.read_unit(), foreign)
 
-    def test_refuses_legacy_installation_takeover(self):
+    def _seed_legacy_plugin_installation(self):
+        """Seed the pre-existing uuplugin.service installation on disk.
+
+        The legacy deployment ships its own ``uuplugin.service`` at
+        ``/etc/systemd/system/uuplugin.service`` plus its monitor data under
+        ``~/uu/``; nothing here uses the manager's own ``uu-accelerator``
+        unit. The fixture only writes files under ``self.root`` and
+        ``self.home``; systemctl state lives in ``FakeSystemctl``.
+        """
+        legacy_unit = (
+            "[Unit]\n"
+            "Description=UU Plugin\n"
+            "Wants=network-online.target\n"
+            "After=network-online.target\n"
+            "[Service]\n"
+            "ExecStart=/bin/sh /home/deck/uu/uuplugin_monitor.sh\n"
+            "[Install]\n"
+            "WantedBy=default.target\n"
+        )
+        legacy_unit_path = self.system / "uuplugin.service"
+        legacy_unit_path.write_text(legacy_unit, encoding="utf-8")
+
+        uu_dir = self.root / "home" / "deck" / "uu"
+        uu_dir.mkdir(parents=True, exist_ok=True)
+        monitor = uu_dir / "uuplugin_monitor.sh"
+        monitor.write_text("#!/bin/sh\n", encoding="utf-8")
+        (uu_dir / "uuplugin_monitor.config").write_text(
+            "router=steam-deck-plugin\nmodel=x86_64\n", encoding="utf-8")
+        # An unrelated file the migration must keep untouched.
+        (uu_dir / "keep.txt").write_text("keep", encoding="utf-8")
+
+        self.systemctl.active.add("uuplugin")
+        self.systemctl.enabled.add("uuplugin")
+        return legacy_unit, legacy_unit_path, uu_dir, monitor
+
+    @staticmethod
+    def _legacy_verbs(calls):
+        return [
+            tuple(call) for call in calls
+            if call and call[-1].endswith("uuplugin.service")
+        ]
+
+    def test_legacy_migration_success_removes_old_and_starts_new(self):
+        """legacy_install=True migrates the old uuplugin install in place.
+
+        A successful ``Manager.install("fex")`` (no new keyword) on a
+        platform reporting ``legacy_install=True`` must stop and disable the
+        old ``uuplugin.service``, remove its file and ``~/uu/`` data, keep
+        unrelated files, and leave the new ``uu-accelerator`` unit active.
+        Only systemctl targeting ``uuplugin.service`` may be the old-service
+        mutations, and every such stop must precede the new start.
+        """
         self.platform = self.platform_dict(legacy_install=True)
+        legacy_unit, legacy_unit_path, uu_dir, _monitor = (
+            self._seed_legacy_plugin_installation())
+        keep = uu_dir / "keep.txt"
+
         self.configure_release("14.9.4")
         manager = self.make_manager()
+        manager.install("fex")
 
-        for engine in ("auto", "fex"):
-            with self.subTest(engine=engine), self.assertRaises(ValueError):
-                manager.install(engine=engine)
+        self.assertFalse(legacy_unit_path.exists())
+        self.assertFalse((uu_dir / "uuplugin_monitor.sh").exists())
+        self.assertFalse((uu_dir / "uuplugin_monitor.config").exists())
+        self.assertIn(UNIT_ID, self.systemctl.active)
+        self.assertTrue(self.unit_path().is_file())
+        self.assertIn(OWNERSHIP_MARKER, self.read_unit())
+        self.assertNotIn("uuplugin", self.systemctl.active)
+        self.assertNotIn("uuplugin", self.systemctl.enabled)
+        self.assertTrue(keep.is_file())
 
+        legacy_calls = self._legacy_verbs(self.systemctl.calls)
+        self.assertTrue(legacy_calls, "legacy unit was never addressed")
+        stop_idx = [i for i, c in enumerate(self.systemctl.calls)
+                    if "stop" in c and c[-1].endswith("uuplugin.service")]
+        new_start_idx = [i for i, c in enumerate(self.systemctl.calls)
+                         if "start" in c and c[-1].endswith(UNIT_FILE)]
+        self.assertTrue(stop_idx, "legacy service was never stopped")
+        self.assertTrue(new_start_idx, "new service was never started")
+        self.assertLess(max(stop_idx), min(new_start_idx))
+
+    def test_legacy_migration_fetch_failure_leaves_old_untouched(self):
+        """A failed metadata fetch must not mutate the legacy service."""
+        self.platform = self.platform_dict(legacy_install=True)
+        legacy_unit, legacy_unit_path, uu_dir, _monitor = (
+            self._seed_legacy_plugin_installation())
+        before_bytes = legacy_unit_path.read_bytes()
+        before_active = set(self.systemctl.active)
+        before_enabled = set(self.systemctl.enabled)
+
+        def broken(*args, **kwargs):
+            raise RuntimeError("metadata fetch failed")
+
+        self.configure_release("14.9.4")
+        manager = self.make_manager(metadata_fetcher=broken)
+        with self.assertRaises(Exception):
+            manager.install("fex")
+
+        self.assertEqual(legacy_unit_path.read_bytes(), before_bytes)
+        self.assertTrue(uu_dir.is_dir())
+        self.assertEqual(self.systemctl.active, before_active)
+        self.assertEqual(self.systemctl.enabled, before_enabled)
+        self.assertEqual(self._legacy_verbs(self.systemctl.calls), [])
+
+    def test_legacy_migration_download_failure_leaves_old_untouched(self):
+        """A failed download (after a successful fetch) must not touch legacy."""
+        self.platform = self.platform_dict(legacy_install=True)
+        legacy_unit, legacy_unit_path, uu_dir, _monitor = (
+            self._seed_legacy_plugin_installation())
+        before_bytes = legacy_unit_path.read_bytes()
+        before_active = set(self.systemctl.active)
+        before_enabled = set(self.systemctl.enabled)
+
+        def broken(metadata, target, **kwargs):
+            self.downloads += 1
+            raise RuntimeError("download failed")
+
+        self.configure_release("14.9.4")
+        manager = self.make_manager(archive_downloader=broken)
+        with self.assertRaises(Exception):
+            manager.install("fex")
+
+        self.assertGreaterEqual(self.downloads, 1)
+        self.assertEqual(legacy_unit_path.read_bytes(), before_bytes)
+        self.assertTrue(uu_dir.is_dir())
+        self.assertEqual(self.systemctl.active, before_active)
+        self.assertEqual(self.systemctl.enabled, before_enabled)
+        self.assertEqual(self._legacy_verbs(self.systemctl.calls), [])
+
+    def test_legacy_migration_failed_new_start_restores_old(self):
+        """A failed new core start must restore the old unit+state, no debris."""
+        self.platform = self.platform_dict(legacy_install=True)
+        legacy_unit, legacy_unit_path, uu_dir, _monitor = (
+            self._seed_legacy_plugin_installation())
+        before_bytes = legacy_unit_path.read_bytes()
+
+        self.configure_release("14.9.4")
+        self.systemctl.fail_start_once.add(UNIT_ID)
+        manager = self.make_manager()
+        with self.assertRaises(Exception):
+            manager.install("fex")
+
+        self.assertEqual(legacy_unit_path.read_bytes(), before_bytes)
+        self.assertTrue(uu_dir.is_dir())
+        self.assertIn("uuplugin", self.systemctl.active)
+        self.assertIn("uuplugin", self.systemctl.enabled)
+        self.assertNotIn(UNIT_ID, self.systemctl.active)
+        self.assertTrue(
+            any("disable" in c and c[-1].endswith("uuplugin.service")
+                for c in self.systemctl.calls),
+            "legacy disable was never attempted")
+        self.assertTrue(
+            any("enable" in c and c[-1].endswith("uuplugin.service")
+                for c in self.systemctl.calls),
+            "legacy enable was never restored")
+
+        new_start = [c for c in self.systemctl.calls
+                     if "start" in c and c[-1].endswith(UNIT_FILE)]
+        self.assertEqual(len(new_start), 1)
+
+    def test_legacy_migration_failed_disable_restores_old(self):
+        """A disable failure after stopping legacy must restore the old unit.
+
+        ``install`` rejects a legacy install it cannot cleanly retire: the old
+        unit was already stopped, so the disable failure must roll the old
+        unit file back into place and never publish the new unit as active.
+        """
+        self.platform = self.platform_dict(legacy_install=True)
+        legacy_unit, legacy_unit_path, uu_dir, _monitor = (
+            self._seed_legacy_plugin_installation())
+        before_bytes = legacy_unit_path.read_bytes()
+
+        self.configure_release("14.9.4")
+        self.systemctl.fail_disable_once.add("uuplugin")
+        manager = self.make_manager()
+        with self.assertRaises(Exception):
+            manager.install("fex")
+
+        self.assertEqual(legacy_unit_path.read_bytes(), before_bytes)
+        self.assertTrue(uu_dir.is_dir())
+        self.assertNotIn(UNIT_ID, self.systemctl.active)
         self.assertFalse(self.unit_path().exists())
+        self.assertTrue(
+            any("disable" in c and c[-1].endswith("uuplugin.service")
+                for c in self.systemctl.calls),
+            "legacy disable was never attempted")
+        self.assertIn("uuplugin", self.systemctl.active)
+        self.assertIn("uuplugin", self.systemctl.enabled)
+        enable_new = [c for c in self.systemctl.calls
+                      if "enable" in c and c[-1].endswith(UNIT_FILE)]
+        self.assertEqual(enable_new, [])
+
+    def test_legacy_migration_rejects_custom_unit_path(self):
+        """A custom ExecStart/path in the legacy unit blocks the takeover."""
+        self.platform = self.platform_dict(legacy_install=True)
+        legacy_unit, legacy_unit_path, uu_dir, _monitor = (
+            self._seed_legacy_plugin_installation())
+        custom = legacy_unit.replace(
+            "ExecStart=/bin/sh /home/deck/uu/uuplugin_monitor.sh",
+            "ExecStart=/opt/evil/monitor.sh")
+        legacy_unit_path.write_text(custom, encoding="utf-8")
+        before_bytes = legacy_unit_path.read_bytes()
+        before_active = set(self.systemctl.active)
+        before_enabled = set(self.systemctl.enabled)
+
+        self.configure_release("14.9.4")
+        manager = self.make_manager()
+        with self.assertRaises(Exception):
+            manager.install("fex")
+
+        self.assertEqual(legacy_unit_path.read_bytes(), before_bytes)
+        self.assertTrue(uu_dir.is_dir())
+        self.assertEqual(self.systemctl.active, before_active)
+        self.assertEqual(self.systemctl.enabled, before_enabled)
+        self.assertEqual(self._legacy_verbs(self.systemctl.calls), [])
+
+    def test_legacy_migration_rejects_symlinked_uu_directory(self):
+        """A symlinked ``~/uu`` must be rejected without side effects."""
+        self.platform = self.platform_dict(legacy_install=True)
+        legacy_unit, legacy_unit_path, uu_dir, _monitor = (
+            self._seed_legacy_plugin_installation())
+        real = uu_dir
+        linked = self.root / "home" / "deck" / "uu_link"
+        real.rename(linked)
+        uu_dir.symlink_to(linked, target_is_directory=True)
+        before_bytes = legacy_unit_path.read_bytes()
+        before_active = set(self.systemctl.active)
+        before_enabled = set(self.systemctl.enabled)
+
+        self.configure_release("14.9.4")
+        manager = self.make_manager()
+        with self.assertRaises(Exception):
+            manager.install("fex")
+
+        self.assertEqual(legacy_unit_path.read_bytes(), before_bytes)
+        self.assertTrue(uu_dir.is_symlink())
+        self.assertTrue((linked / "keep.txt").is_file())
+        self.assertEqual(self.systemctl.active, before_active)
+        self.assertEqual(self.systemctl.enabled, before_enabled)
+        self.assertEqual(self._legacy_verbs(self.systemctl.calls), [])
+
+    def test_legacy_migration_same_md5_skips_redownload(self):
+        """Same-MD5 reinstall migrates legacy without re-downloading.
+
+        Install FEX first, stop it, seed the legacy installation, then invoke
+        the same install with the same release. The cached payload must be
+        reused (no download), the old file removed, and the new unit active.
+        """
+        self.configure_release("14.9.4")
+        first = self.make_manager()
+        first.install("fex")
+        first.stop()
+        self.assertNotIn(UNIT_ID, self.systemctl.active)
+
+        self.platform = self.platform_dict(legacy_install=True)
+        legacy_unit, legacy_unit_path, uu_dir, _monitor = (
+            self._seed_legacy_plugin_installation())
+
+        downloads_before = self.downloads
+        same = self.make_manager()
+        same.install("fex")
+
+        self.assertEqual(self.downloads, downloads_before)
+        self.assertFalse(legacy_unit_path.exists())
+        self.assertFalse((uu_dir / "uuplugin_monitor.sh").exists())
+        self.assertFalse((uu_dir / "uuplugin_monitor.config").exists())
+        self.assertIn(UNIT_ID, self.systemctl.active)
+        self.assertIn(OWNERSHIP_MARKER, self.read_unit())
+        self.assertNotIn("uuplugin", self.systemctl.active)
+        self.assertNotIn("uuplugin", self.systemctl.enabled)
 
     # -- lifecycle regressions -------------------------------------------
     def test_successful_mutation_clears_stale_install_error(self):

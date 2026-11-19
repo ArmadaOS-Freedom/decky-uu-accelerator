@@ -1,7 +1,7 @@
 """Installation manager for the UU accelerator plugin.
 
-This module owns the whole install lifecycle: detecting the host, refusing to
-take over a legacy install, fetching official metadata, downloading and
+This module owns the whole install lifecycle: detecting the host, optionally
+migrating a legacy install when explicitly allowed, fetching official metadata, downloading and
 verifying a package, extracting it into a task-owned release directory,
 switching the live ``run/`` symlinks and unit, starting/stopping the plugin's
 *own* systemd unit, and rolling back cleanly when anything fails.
@@ -35,6 +35,7 @@ from pathlib import Path
 
 from . import payload
 from .binding import terminal_qr_svg
+from .legacy import OfficialInstall
 from .platform import detect_platform, select_engine
 from .service import OWNERSHIP_MARKER, UNIT_NAME, build_unit
 
@@ -88,9 +89,21 @@ _SYSTEMCTL_TIMEOUT = 60
 
 def _run_systemctl(argv):
     """Default command hook: a bounded, shell-free ``systemctl`` invocation."""
-    return subprocess.run(
-        list(argv), capture_output=True, text=True, timeout=_SYSTEMCTL_TIMEOUT
-    )
+    argv = list(argv)
+    # uuplugin.service has TimeoutStopSec=60 and a 60s ExecStop guardian loop;
+    # give its stop extra headroom so systemd termination can complete.
+    timeout = 150 if argv == ["systemctl", "stop", "uuplugin.service"] else _SYSTEMCTL_TIMEOUT
+    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+
+
+class _InstallRollbackError(RuntimeError):
+    """Raised when ``_switch_and_start``'s own ``_rollback`` failed.
+
+    Used only by ``_do_install`` to distinguish a candidate whose rollback
+    failed (and may therefore still be the live active service) from a case
+    where the *previous* service was successfully restored and is simply
+    active again.
+    """
 
 
 class Manager:
@@ -357,7 +370,14 @@ class Manager:
     def _do_install(self, engine):
         self._update("detecting", 5)
         platform = self._platform()
-        choice = select_engine(platform, engine)  # refuses legacy on every route
+        legacy = None
+        if platform.get("legacy_install"):
+            legacy = OfficialInstall(
+                self.root, self.system_dir, self.home, self._command_runner
+            )
+        choice = select_engine(
+            platform, engine, allow_legacy_takeover=legacy is not None
+        )
         self._assert_own_unit()  # refuses a conflicting unit we do not own
         manifest = self._read_manifest()
 
@@ -368,7 +388,8 @@ class Manager:
             raise ValueError("下载元数据校验值无效")
 
         if (
-            manifest is not None
+            legacy is None
+            and manifest is not None
             and manifest.get("engine") == choice["engine"]
             and str(manifest.get("md5") or "").lower() == md5
         ):
@@ -393,9 +414,69 @@ class Manager:
             # unsuccessful stop leaves the old unit/manifest/current payload
             # untouched, with no implicit second stop/restart in rollback.
             self._stop_unit()
-        self._switch_and_start(
-            choice, version, md5, release, manifest, was_active, was_enabled
-        )
+        if legacy is not None:
+            try:
+                legacy.pause()
+            except BaseException as exc:
+                # Owned service was already stopped above; restore it first if
+                # it had been active, then roll back any partial legacy pause.
+                recovery_errors = []
+                if was_active:
+                    try:
+                        if not self._start_unit() or not self._is_active():
+                            recovery_errors.append("恢复原服务失败")
+                    except BaseException as start_exc:
+                        recovery_errors.append("恢复原服务失败: {}".format(start_exc))
+                try:
+                    legacy.restore()
+                except BaseException as restore_exc:
+                    recovery_errors.append("恢复旧安装失败: {}".format(restore_exc))
+                if recovery_errors:
+                    raise RuntimeError(
+                        "{}；恢复失败: {}".format(exc, "；".join(recovery_errors))
+                    ) from exc
+                raise
+        try:
+            self._switch_and_start(
+                choice, version, md5, release, manifest, was_active, was_enabled,
+                force_start=legacy is not None,
+            )
+        except BaseException as exc:
+            if legacy is None:
+                raise
+            failed_rollback = isinstance(exc, _InstallRollbackError)
+            if not failed_rollback and was_active and not self._is_active():
+                # The previously owned service was active, the switch/rollback
+                # stopped it, and nothing is live now: bring the original
+                # owned service back up before migrating on to the legacy
+                # install. This only runs when the failure happened *outside*
+                # ``_switch_and_start`` (e.g. a ``_snapshot`` failure) and the
+                # prior service was ours and active.
+                try:
+                    if not self._start_unit() or not self._is_active():
+                        raise RuntimeError("恢复原服务失败")
+                except BaseException as start_exc:
+                    raise RuntimeError(
+                        "{}；恢复原服务失败: {}".format(exc, start_exc)
+                    ) from exc
+            candidate_live = self._is_active()
+            if candidate_live and (not was_active or failed_rollback):
+                # Candidate is live and either there was no prior owned service
+                # or the rollback itself failed; keep the legacy install paused
+                # and surface the original failure instead of restoring the old
+                # install under a live candidate.
+                raise RuntimeError(
+                    "{}；候选服务仍在运行，旧安装保持暂停，未恢复".format(exc)
+                ) from exc
+            try:
+                legacy.restore()
+            except BaseException as restore_exc:
+                raise RuntimeError(
+                    "{}；恢复旧安装失败: {}".format(exc, restore_exc)
+                ) from exc
+            raise
+        if legacy is not None:
+            legacy.finish()
         return self._read_manifest()
 
     def _prepare_release(self, choice, metadata, md5):
@@ -438,7 +519,7 @@ class Manager:
         return final, outcome.get("version")
 
     def _switch_and_start(self, choice, version, md5, release, manifest,
-                          was_active, was_enabled):
+                          was_active, was_enabled, *, force_start=False):
         """Flip the live state to a ready candidate, with rollback on failure."""
         snapshot = self._snapshot(manifest)
         first_install = manifest is None
@@ -446,7 +527,7 @@ class Manager:
         try:
             self._update("starting", 88)
             self._activate_release(choice, release)
-            if first_install or was_active:
+            if first_install or was_active or force_start:
                 if not self._start_unit():
                     raise RuntimeError("UU 加速器服务启动失败")
                 if not self._is_active():
@@ -461,7 +542,7 @@ class Manager:
             try:
                 self._rollback(snapshot, was_active, was_enabled)
             except BaseException as rollback_exc:
-                raise RuntimeError(
+                raise _InstallRollbackError(
                     "{}；回滚失败: {}".format(exc, rollback_exc)
                 ) from exc
             raise
