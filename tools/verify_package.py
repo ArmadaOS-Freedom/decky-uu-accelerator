@@ -5,11 +5,11 @@ Opens an already-built ``.zip`` produced by ``tools/package_plugin.py`` and
 checks, without executing anything, that:
 
 * the ZIP CRCs are intact (``ZipFile.testzip`` returns ``None``);
-* it contains exactly the thirty expected members under a single top-level
-  ``uu-accelerator/`` directory;
+* it contains exactly the expected members (see ``EXPECTED_ENTRIES``)
+  under a single top-level ``uu-accelerator/`` directory;
 * ``plugin.json`` declares the exact display name ``UU加速器`` with
   ``api_version == 1`` and ``flags == ["root"]``;
-* ``package.json`` declares name ``uu-accelerator`` and version ``0.3``;
+* ``package.json`` declares name ``uu-accelerator`` and version ``0.4``;
 * no member path contains a vendor/cores/tests/tools/node_modules/cache
   segment;
 * the eight ELF members are the two baseline modules, the two modules of each
@@ -53,7 +53,7 @@ EXPECTED_PLUGIN_NAME = "UU加速器"
 
 # package.json identity.
 EXPECTED_PACKAGE_NAME = "uu-accelerator"
-EXPECTED_VERSION = "0.3"
+EXPECTED_VERSION = "0.4"
 
 # plugin.json identity.
 EXPECTED_API_VERSION = 1
@@ -125,7 +125,7 @@ CHILD_IDENTITY_FIELDS = (
     "config_sha256",
 )
 
-# The twenty-three members that must be present, and nothing else.
+# The expected members that must be present, and nothing else.
 EXPECTED_ENTRIES = (
     f"{PLUGIN_DIR}/plugin.json",
     f"{PLUGIN_DIR}/package.json",
@@ -141,6 +141,7 @@ EXPECTED_ENTRIES = (
     f"{PLUGIN_DIR}/py_modules/uu_accelerator/manager.py",
     f"{PLUGIN_DIR}/py_modules/uu_accelerator/service.py",
     f"{PLUGIN_DIR}/py_modules/uu_accelerator/binding.py",
+    f"{PLUGIN_DIR}/py_modules/uu_accelerator/legacy.py",
     f"{COMPAT_DIR}/xt_cgroup.ko",
     f"{COMPAT_DIR}/xt_cgroup.c",
     f"{COMPAT_DIR}/xt_nat.ko",
@@ -159,8 +160,9 @@ EXPECTED_ENTRIES = (
     f"{COMPAT_PORTABLE_DIR}/xt_nat.abi.json",
 )
 
-# The nine parseable Python members: project-root main.py + supervisor.py +
-# kernel_abi.py plus the six uu_accelerator package modules.
+# The parseable Python members: project-root main.py + supervisor.py +
+# kernel_abi.py plus the seven uu_accelerator package modules. Derived from
+# EXPECTED_ENTRIES so the count never needs to be hand-maintained.
 EXPECTED_PY = tuple(name for name in EXPECTED_ENTRIES if name.endswith(".py"))
 
 # Path segments that must never appear in a packaged member.
@@ -383,7 +385,7 @@ def main(argv=None) -> int:
 
         index_data = archive.read(_INDEX_ENTRY) if _INDEX_ENTRY in names else b""
         checks["dist_index_nonempty"] = len(index_data) > 0
-        checks["python_modules_packaged"] = len(parsed_py) == 9
+        checks["python_modules_packaged"] = len(parsed_py) == len(EXPECTED_PY)
         checks["python_modules_exact"] = sorted(parsed_py) == sorted(EXPECTED_PY)
 
     # --- metadata ---------------------------------------------------------
