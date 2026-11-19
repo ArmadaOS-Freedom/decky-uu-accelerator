@@ -407,6 +407,7 @@ class Manager:
             return manifest
 
         release, version = self._prepare_release(choice, metadata, md5)
+        snapshot = self._snapshot(manifest)
         was_active = self._is_active()
         was_enabled = self._is_enabled()
         if was_active:
@@ -439,26 +440,12 @@ class Manager:
         try:
             self._switch_and_start(
                 choice, version, md5, release, manifest, was_active, was_enabled,
-                force_start=legacy is not None,
+                snapshot=snapshot, force_start=legacy is not None,
             )
         except BaseException as exc:
             if legacy is None:
                 raise
             failed_rollback = isinstance(exc, _InstallRollbackError)
-            if not failed_rollback and was_active and not self._is_active():
-                # The previously owned service was active, the switch/rollback
-                # stopped it, and nothing is live now: bring the original
-                # owned service back up before migrating on to the legacy
-                # install. This only runs when the failure happened *outside*
-                # ``_switch_and_start`` (e.g. a ``_snapshot`` failure) and the
-                # prior service was ours and active.
-                try:
-                    if not self._start_unit() or not self._is_active():
-                        raise RuntimeError("恢复原服务失败")
-                except BaseException as start_exc:
-                    raise RuntimeError(
-                        "{}；恢复原服务失败: {}".format(exc, start_exc)
-                    ) from exc
             candidate_live = self._is_active()
             if candidate_live and (not was_active or failed_rollback):
                 # Candidate is live and either there was no prior owned service
@@ -519,9 +506,9 @@ class Manager:
         return final, outcome.get("version")
 
     def _switch_and_start(self, choice, version, md5, release, manifest,
-                          was_active, was_enabled, *, force_start=False):
+                          was_active, was_enabled, *, snapshot,
+                          force_start=False):
         """Flip the live state to a ready candidate, with rollback on failure."""
-        snapshot = self._snapshot(manifest)
         first_install = manifest is None
 
         try:

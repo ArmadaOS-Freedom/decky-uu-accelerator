@@ -18,6 +18,7 @@ import io
 import json
 import os
 import shutil
+import stat
 import subprocess
 import tarfile
 import tempfile
@@ -729,6 +730,31 @@ class ManagerTestCase(unittest.TestCase):
         # An unrelated file the migration must keep untouched.
         (uu_dir / "keep.txt").write_text("keep", encoding="utf-8")
 
+        from uu_accelerator import legacy as _legacy_mod
+
+        seeded_unit_str = str(legacy_unit_path)
+        original_plain_root_owned = _legacy_mod._is_plain_root_owned
+
+        def _fixture_plain_root_owned(path, _orig=original_plain_root_owned):
+            try:
+                same = os.fspath(path) == seeded_unit_str
+            except TypeError:
+                same = False
+            if not same:
+                return _orig(path)
+            # Emulate root ownership for the fixture path only: keep the
+            # regular-file and world/group-writable checks, drop the uid bit.
+            try:
+                st = os.lstat(path)
+            except OSError:
+                return False
+            return stat.S_ISREG(st.st_mode) and not (st.st_mode & 0o022)
+
+        patcher = mock.patch.object(
+            _legacy_mod, "_is_plain_root_owned", _fixture_plain_root_owned)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
         self.systemctl.active.add("uuplugin")
         self.systemctl.enabled.add("uuplugin")
         return legacy_unit, legacy_unit_path, uu_dir, monitor
@@ -857,6 +883,76 @@ class ManagerTestCase(unittest.TestCase):
         new_start = [c for c in self.systemctl.calls
                      if "start" in c and c[-1].endswith(UNIT_FILE)]
         self.assertEqual(len(new_start), 1)
+
+    def test_retired_native_legacy_unit_restored_after_failed_activation(self):
+        self.configure_release("14.9.4")
+        manager = self.make_manager()
+        manager.install("fex")
+        manager.set_autostart(True)
+        legacy_unit, legacy_unit_path, _uu_dir, _monitor = (
+            self._seed_legacy_plugin_installation())
+        old_bytes = legacy_unit_path.read_bytes()
+        self.platform["legacy_install"] = True
+        self._seed_legacy_manifest(manager, "native")
+        self.systemctl.calls.clear()
+        self.systemctl.fail_start_once.add(UNIT_ID)
+        self.configure_release("15.0.0")
+        with self.assertRaisesRegex(RuntimeError, "UU 加速器服务启动失败"):
+            manager.install("fex")
+        own_starts = [c for c in self.systemctl.calls
+                      if "start" in c and c[-1] == UNIT_FILE]
+        self.assertEqual(len(own_starts), 1)
+        self.assertNotIn(UNIT_ID, self.systemctl.active)
+        self.assertNotIn(UNIT_ID, self.systemctl.enabled)
+        self.assertEqual(legacy_unit_path.read_bytes(), old_bytes)
+        self.assertIn("uuplugin", self.systemctl.active)
+        self.assertIn("uuplugin", self.systemctl.enabled)
+
+    def test_retired_native_snapshot_failure_leaves_state_untouched(self):
+        self.configure_release("14.9.4")
+        manager = self.make_manager()
+        manager.install("fex")
+        manager.set_autostart(True)
+        legacy_unit, legacy_unit_path, _uu_dir, _monitor = (
+            self._seed_legacy_plugin_installation())
+        old_bytes = legacy_unit_path.read_bytes()
+        self.platform["legacy_install"] = True
+        self._seed_legacy_manifest(manager, "native")
+        before_active = set(self.systemctl.active)
+        before_enabled = set(self.systemctl.enabled)
+        self.systemctl.calls.clear()
+        self.configure_release("15.0.0")
+        with mock.patch.object(
+                manager, "_snapshot",
+                side_effect=RuntimeError("snapshot fault")):
+            with self.assertRaisesRegex(RuntimeError, "snapshot fault"):
+                manager.install("fex")
+        tokens = [token for call in self.systemctl.calls for token in call]
+        for verb in ("stop", "disable", "start", "restart", "enable"):
+            self.assertNotIn(verb, tokens)
+        self.assertEqual(self.systemctl.active, before_active)
+        self.assertEqual(self.systemctl.enabled, before_enabled)
+        self.assertEqual(legacy_unit_path.read_bytes(), old_bytes)
+
+    def test_fex_rollback_both_starts_fail_restores_official(self):
+        self.configure_release("14.9.4")
+        manager = self.make_manager()
+        manager.install("fex")
+        manager.set_autostart(True)
+        legacy_unit, legacy_unit_path, _uu_dir, _monitor = (
+            self._seed_legacy_plugin_installation())
+        old_bytes = legacy_unit_path.read_bytes()
+        self.platform["legacy_install"] = True
+        self.configure_release("15.0.0")
+        with mock.patch.object(
+                manager, "_start_unit", return_value=False) as start_unit:
+            with self.assertRaisesRegex(RuntimeError, "回滚后服务启动失败"):
+                manager.install("fex")
+        self.assertEqual(start_unit.call_count, 2)
+        self.assertNotIn(UNIT_ID, self.systemctl.active)
+        self.assertEqual(legacy_unit_path.read_bytes(), old_bytes)
+        self.assertIn("uuplugin", self.systemctl.active)
+        self.assertIn("uuplugin", self.systemctl.enabled)
 
     def test_legacy_migration_failed_disable_restores_old(self):
         """A disable failure after stopping legacy must restore the old unit.
